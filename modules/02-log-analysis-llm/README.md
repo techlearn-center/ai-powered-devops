@@ -12,174 +12,232 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of Log Analysis with LLMs
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Parse syslog, JSON, and nginx access log formats into structured entries
+- Detect error-rate spikes and repeated failure patterns using statistical methods
+- Cluster similar errors using fuzzy fingerprinting
+- Use LLMs to generate root-cause hypotheses from anomaly data
+- Index and search logs in Elasticsearch
 
 ---
 
 ## Concepts
 
-### What is Log Analysis with LLMs?
+### The Log Analysis Pipeline
 
-Log Analysis with LLMs is a fundamental component of AI-Powered DevOps: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
-
-**Real-world analogy:** Think of Log Analysis with LLMs like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
-
-### Why Does This Matter?
-
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+```
+Raw Logs (syslog, JSON, nginx)
+        |
+        v
++------------------+
+|   Log Parser     |  <-- regex + JSON parsing
+|   (multi-format) |
++------------------+
+        |
+        v
++------------------+
+| Anomaly Detector |  <-- error-rate spikes, repeated errors, criticals
++------------------+
+        |
+        v
++------------------+
+| Error Clusterer  |  <-- fuzzy fingerprinting (normalize IPs, IDs, numbers)
++------------------+
+        |
+        v
++------------------+
+| LLM Root-Cause   |  <-- GPT-4 with structured prompt
+| Analysis         |
++------------------+
+        |
+        v
++------------------+
+| AnomalyReport    |  <-- severity, clusters, suggestions
++------------------+
+```
 
 ### Key Terminology
 
 | Term | Definition |
 |---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+| **Fuzzy Fingerprinting** | Normalizing variable parts of log messages (IPs, timestamps, IDs) so similar errors cluster together |
+| **Error Cluster** | A group of log entries that represent the same underlying failure pattern |
+| **Anomaly Report** | Structured output containing detected anomalies, clusters, severity, and root-cause suggestions |
+| **Root-Cause Analysis** | LLM-generated hypotheses explaining why the errors are occurring |
 
 ---
 
 ## Hands-On Lab
 
-### Prerequisites Check
+### Step 1: Understanding the Log Parser
 
-Before starting, verify your environment:
+The parser in `src/log_analysis/log_analyzer.py` handles three formats:
 
-```bash
-# Check Docker is running
-docker --version
-docker compose version
+```python
+from src.log_analysis.log_analyzer import parse_log_line
 
-# Check you have the project cloned
-ls modules/02-log-analysis-llm/
+# JSON structured log
+entry = parse_log_line('{"timestamp":"2024-01-15T10:30:00Z","level":"ERROR","service":"auth","message":"Token expired"}')
+print(entry.level)    # "error"
+print(entry.service)  # "auth"
+
+# Syslog format
+entry = parse_log_line("Jan 15 10:30:01 web-01 nginx[1234]: upstream timed out (110: Connection timed out)")
+print(entry.service)  # "nginx"
+print(entry.level)    # "error"
+
+# Nginx access log
+entry = parse_log_line('192.168.1.1 - - [15/Jan/2024:10:30:00 +0000] "GET /api/users HTTP/1.1" 500 1234')
+print(entry.level)    # "error" (status 500)
+print(entry.metadata) # {"ip": "192.168.1.1", "status": 500, "bytes": 1234}
 ```
 
-### Exercise 1: Setup and Configuration
+### Step 2: Error Clustering with Fuzzy Fingerprints
 
-**Goal:** Get the foundation in place for this module.
+```python
+"""
+error_clustering_lab.py - How fingerprinting groups similar errors
+"""
+import re
+import hashlib
+from collections import Counter
 
-**Step 1:** Review the starter files
-```bash
-ls modules/02-log-analysis-llm/lab/starter/
+
+def fingerprint(message: str) -> str:
+    """Normalize a log message for clustering."""
+    cleaned = message
+    cleaned = re.sub(r"\b\d+\b", "N", cleaned)
+    cleaned = re.sub(r"\b[0-9a-f]{8,}\b", "HEX", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "IP", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
+    return hashlib.md5(cleaned.encode()).hexdigest()[:12]
+
+
+# These different messages produce the SAME fingerprint:
+messages = [
+    "Connection to 10.0.1.15:5432 failed after 30ms (attempt 1 of 3)",
+    "Connection to 10.0.2.20:5432 failed after 45ms (attempt 2 of 3)",
+    "Connection to 192.168.1.1:5432 failed after 12ms (attempt 1 of 3)",
+]
+
+fingerprints = [fingerprint(m) for m in messages]
+print(f"All same cluster: {len(set(fingerprints)) == 1}")  # True
 ```
 
-**Step 2:** Set up the required environment
-```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/02-log-analysis-llm/lab/starter/
+### Step 3: Full Analysis Pipeline
+
+```python
+"""
+full_analysis_lab.py - End-to-end log analysis with LLM root-cause
+"""
+import asyncio
+from src.log_analysis.log_analyzer import LogAnalyzer
+
+sample_logs = [
+    '{"timestamp":"2024-01-15T10:30:00Z","level":"INFO","service":"api-gateway","message":"Request received GET /api/users"}',
+    '{"timestamp":"2024-01-15T10:30:02Z","level":"ERROR","service":"order-service","message":"Database connection timeout after 5000ms"}',
+    '{"timestamp":"2024-01-15T10:30:02Z","level":"ERROR","service":"order-service","message":"Database connection timeout after 5000ms"}',
+    '{"timestamp":"2024-01-15T10:30:03Z","level":"ERROR","service":"order-service","message":"Database connection timeout after 5000ms"}',
+    '{"timestamp":"2024-01-15T10:30:03Z","level":"ERROR","service":"order-service","message":"Database connection timeout after 3000ms"}',
+    '{"timestamp":"2024-01-15T10:30:04Z","level":"ERROR","service":"order-service","message":"Database connection timeout after 5000ms"}',
+    '{"timestamp":"2024-01-15T10:30:04Z","level":"CRITICAL","service":"order-service","message":"Circuit breaker OPEN for database pool"}',
+    '{"timestamp":"2024-01-15T10:30:05Z","level":"ERROR","service":"payment-service","message":"Upstream order-service unavailable"}',
+]
+
+
+async def main():
+    analyzer = LogAnalyzer()
+    report = await analyzer.analyze_logs(
+        raw_logs=sample_logs,
+        context="Recent deployment of order-service v2.3.1 at 10:25 UTC",
+    )
+
+    print(f"Severity: {report.severity}")
+    print(f"Analyzed: {report.analyzed_count} logs")
+    print(f"Anomalies: {report.anomaly_count}")
+    print(f"Summary: {report.summary}")
+
+    print("\n--- Error Clusters ---")
+    for c in report.error_clusters:
+        print(f"  {c['count']}x | Services: {c['services']} | {c['sample_message'][:80]}")
+
+    print("\n--- Root Cause Suggestions ---")
+    for suggestion in report.root_cause_suggestions:
+        print(f"  - {suggestion}")
+
+asyncio.run(main())
 ```
 
-**Step 3:** Verify the setup
+### Step 4: Elasticsearch Integration
+
+```python
+"""
+es_integration_lab.py - Index parsed logs into Elasticsearch
+"""
+import asyncio
+from elasticsearch import AsyncElasticsearch
+from src.log_analysis.log_analyzer import LogAnalyzer, parse_log_line
+
+async def index_and_search():
+    es = AsyncElasticsearch("http://localhost:9200")
+    analyzer = LogAnalyzer()
+
+    logs = [
+        '{"timestamp":"2024-01-15T10:30:02Z","level":"ERROR","service":"auth-service","message":"JWT validation failed: token expired"}',
+        '{"timestamp":"2024-01-15T10:30:03Z","level":"ERROR","service":"auth-service","message":"JWT validation failed: invalid signature"}',
+    ]
+    entries = [parse_log_line(line) for line in logs]
+    await analyzer.ingest_to_elasticsearch(entries)
+
+    result = await es.search(
+        index="ai-devops-logs",
+        body={"query": {"bool": {"must": [{"match": {"level": "error"}}, {"match": {"service": "auth-service"}}]}}},
+    )
+
+    for hit in result["hits"]["hits"]:
+        print(f"[{hit['_source']['level']}] {hit['_source']['service']}: {hit['_source']['message']}")
+
+    await es.close()
+
+asyncio.run(index_and_search())
+```
+
+### Step 5: REST API Usage
+
 ```bash
-# Run the validation to check your setup
+# Start the server
+uvicorn src.main:app --reload
+
+# Analyze logs via the API
+curl -X POST http://localhost:8000/api/logs/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "logs": [
+      "{\"level\":\"ERROR\",\"service\":\"db\",\"message\":\"Connection pool exhausted\"}",
+      "{\"level\":\"ERROR\",\"service\":\"db\",\"message\":\"Connection pool exhausted\"}",
+      "{\"level\":\"CRITICAL\",\"service\":\"db\",\"message\":\"All connections dead\"}"
+    ],
+    "context": "Database maintenance ended 10 minutes ago"
+  }'
+```
+
+---
+
+## Key Takeaways
+
+1. Multi-format parsing is essential -- production environments generate syslog, JSON, and access log formats simultaneously.
+2. Fuzzy fingerprinting catches variations (different IPs, request IDs) that exact matching misses.
+3. Statistical anomaly detection runs fast and filters noise before sending data to the LLM.
+4. The LLM synthesizes patterns across clusters into human-readable root-cause hypotheses.
+5. Elasticsearch provides search and retention for historical trend analysis.
+
+---
+
+## Validation
+
+```bash
 bash modules/02-log-analysis-llm/validation/validate.sh
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
-
-### Exercise 2: Core Implementation
-
-**Goal:** Implement the main concept of this module.
-
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
-
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
-
-### Exercise 3: Integration and Testing
-
-**Goal:** Connect this module's work with the broader system.
-
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
-
 ---
 
-## Starter Files
-
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
-
-## Solution Files
-
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
-
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
-
----
-
-## Common Mistakes
-
-| Mistake | Symptom | Fix |
-|---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
-
----
-
-## Self-Check Questions
-
-Test your understanding before moving on:
-
-1. What is the main purpose of Log Analysis with LLMs?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
-
----
-
-## You Know You Have Completed This Module When...
-
-- [ ] All exercises completed
-- [ ] Validation script passes: `bash modules/02-log-analysis-llm/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
-- [ ] Self-check questions answered confidently
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
-```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
-```
-
-**Issue: Permission denied**
-```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
-```
-
----
-
-**Next: [Module 03 →](../03-anomaly-detection/)**
+**Next: [Module 03 ->](../03-anomaly-detection/)**

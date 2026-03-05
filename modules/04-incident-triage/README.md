@@ -12,174 +12,216 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of Automated Incident Triage
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Classify incident severity using a hybrid rule-based + LLM approach
+- Map service dependencies to calculate blast radius
+- Match incidents to runbooks using keyword heuristics and LLM enrichment
+- Detect duplicate and related incidents to reduce noise
+- Route incidents to the correct on-call team
 
 ---
 
 ## Concepts
 
-### What is Automated Incident Triage?
+### The Triage Pipeline
 
-Automated Incident Triage is a fundamental component of AI-Powered DevOps: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
-
-**Real-world analogy:** Think of Automated Incident Triage like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
-
-### Why Does This Matter?
-
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+```
+Alert Sources               Triage Pipeline                  Outputs
++--------------+     +------------------------+       +------------------+
+| Prometheus   |---->| 1. Context Extraction  |       | TriageResult     |
+| PagerDuty    |---->| 2. LLM Classification  |------>|  - severity      |
+| Datadog      |---->| 3. Severity Rules      |       |  - runbooks      |
+| CloudWatch   |     | 4. Blast Radius Calc   |       |  - team routing  |
++--------------+     | 5. Runbook Matching    |       |  - actions       |
+                     | 6. Dedup Check         |       +------------------+
+                     +------------------------+
+```
 
 ### Key Terminology
 
 | Term | Definition |
 |---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+| **SEV1** | Total outage, customer-facing impact, all-hands response |
+| **SEV2** | Partial outage, degraded service for a subset of users |
+| **SEV3** | Minor issue with limited impact, can wait for business hours |
+| **Blast Radius** | The set of services and users affected by a failure |
+| **Runbook** | Step-by-step guide for diagnosing and resolving a specific type of incident |
+| **Deduplication** | Detecting that a new alert is the same incident already being tracked |
 
 ---
 
 ## Hands-On Lab
 
-### Prerequisites Check
+### Step 1: Understanding the Data Models
 
-Before starting, verify your environment:
+```python
+from src.incident.auto_triage import (
+    IncidentAlert, Severity, SERVICE_DEPENDENCIES, TEAM_ROUTING,
+)
 
-```bash
-# Check Docker is running
-docker --version
-docker compose version
+alert = IncidentAlert(
+    alert_name="HighErrorRate",
+    source="prometheus",
+    description="Error rate for order-service exceeded 5% for 10 minutes",
+    labels={"service": "order-service", "namespace": "production"},
+    annotations={"summary": "Order service error rate is 8.3%"},
+)
 
-# Check you have the project cloned
-ls modules/04-incident-triage/
+print(f"Alert: {alert.alert_name}")
+print(f"Service: {alert.labels.get('service')}")
+
+# Service dependency map
+for parent, deps in SERVICE_DEPENDENCIES.items():
+    print(f"  {parent} depends on {deps}")
+
+# Team routing
+for svc, team in TEAM_ROUTING.items():
+    print(f"  {svc} -> {team}")
 ```
 
-### Exercise 1: Setup and Configuration
+### Step 2: Running the Full Triage Pipeline
 
-**Goal:** Get the foundation in place for this module.
+```python
+"""
+triage_pipeline_lab.py - Triage a database connection failure
+"""
+import asyncio
+from src.incident.auto_triage import IncidentTriageEngine, IncidentAlert
 
-**Step 1:** Review the starter files
-```bash
-ls modules/04-incident-triage/lab/starter/
+async def main():
+    engine = IncidentTriageEngine()
+
+    alert = IncidentAlert(
+        alert_name="DatabaseConnectionFailure",
+        source="prometheus",
+        description="order-db connection pool exhausted, all connections in use",
+        labels={"service": "order-service", "instance": "order-db-primary"},
+    )
+
+    result = await engine.triage_incident(alert)
+
+    print(f"Incident: {result.incident_id}")
+    print(f"Severity: {result.severity.value}")
+    print(f"Title: {result.title}")
+    print(f"Affected: {result.affected_services}")
+    print(f"Team: {result.escalation_team}")
+    print(f"Confidence: {result.confidence_score}")
+
+    for rb in result.suggested_runbooks:
+        print(f"\nRunbook: {rb.title}")
+        for step in rb.steps[:3]:
+            print(f"  - {step}")
+
+    for action in result.recommended_actions:
+        print(f"Action: {action}")
+
+asyncio.run(main())
 ```
 
-**Step 2:** Set up the required environment
-```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/04-incident-triage/lab/starter/
+### Step 3: Blast Radius Calculation
+
+```python
+"""
+blast_radius_lab.py - Calculate downstream impact of a service failure
+"""
+from src.incident.auto_triage import SERVICE_DEPENDENCIES
+
+
+def calculate_blast_radius(failed_service: str) -> dict:
+    directly_affected = set()
+    indirectly_affected = set()
+
+    for parent, deps in SERVICE_DEPENDENCIES.items():
+        if failed_service in deps:
+            directly_affected.add(parent)
+
+    for parent, deps in SERVICE_DEPENDENCIES.items():
+        for affected in directly_affected:
+            if affected in deps:
+                indirectly_affected.add(parent)
+
+    return {
+        "failed_service": failed_service,
+        "directly_affected": sorted(directly_affected),
+        "indirectly_affected": sorted(indirectly_affected - directly_affected),
+        "total_impact": len(directly_affected) + len(indirectly_affected),
+    }
+
+
+# What happens when user-db goes down?
+impact = calculate_blast_radius("user-db")
+print(f"Failed: {impact['failed_service']}")
+print(f"Direct impact: {impact['directly_affected']}")
+print(f"Indirect impact: {impact['indirectly_affected']}")
 ```
 
-**Step 3:** Verify the setup
+### Step 4: Severity Classification Deep Dive
+
+```python
+"""
+severity_lab.py - Test severity classification with different alerts
+"""
+import asyncio
+from src.incident.auto_triage import IncidentTriageEngine, IncidentAlert
+
+async def main():
+    engine = IncidentTriageEngine()
+
+    test_cases = [
+        ("Total Outage", IncidentAlert(
+            alert_name="ServiceOutage",
+            description="Complete outage - API returning 503 for all requests",
+            labels={"service": "api-gateway"})),
+        ("Degraded", IncidentAlert(
+            alert_name="HighLatency",
+            description="Degraded response times, P99 latency at 5 seconds",
+            labels={"service": "order-service"})),
+        ("Minor", IncidentAlert(
+            alert_name="LogParsingError",
+            description="Log aggregator unable to parse 2% of incoming logs",
+            labels={"service": "log-collector"})),
+    ]
+
+    for name, alert in test_cases:
+        result = await engine.triage_incident(alert)
+        print(f"[{result.severity.value}] {name}: {result.title}")
+
+asyncio.run(main())
+```
+
+### Step 5: REST API Usage
+
 ```bash
-# Run the validation to check your setup
+curl -X POST http://localhost:8000/api/incidents/triage \
+  -H "Content-Type: application/json" \
+  -d '{
+    "alert_name": "HighMemoryUsage",
+    "source": "prometheus",
+    "description": "Memory at 95% on order-service pods",
+    "labels": {"service": "order-service", "namespace": "production"}
+  }'
+
+# View recent triaged incidents
+curl http://localhost:8000/api/incidents/recent
+```
+
+---
+
+## Key Takeaways
+
+1. Hybrid severity classification (rules + LLM) catches edge cases that pure rules miss while maintaining determinism for obvious scenarios.
+2. Service dependency maps are critical for blast-radius analysis -- a single database failure may bring down five upstream services.
+3. Runbook matching reduces MTTR by giving responders immediate, actionable steps.
+4. Duplicate detection prevents alert fatigue and ensures related incidents are tracked together.
+5. Team routing based on service ownership ensures the right people are paged.
+
+---
+
+## Validation
+
+```bash
 bash modules/04-incident-triage/validation/validate.sh
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
-
-### Exercise 2: Core Implementation
-
-**Goal:** Implement the main concept of this module.
-
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
-
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
-
-### Exercise 3: Integration and Testing
-
-**Goal:** Connect this module's work with the broader system.
-
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
-
 ---
 
-## Starter Files
-
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
-
-## Solution Files
-
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
-
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
-
----
-
-## Common Mistakes
-
-| Mistake | Symptom | Fix |
-|---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
-
----
-
-## Self-Check Questions
-
-Test your understanding before moving on:
-
-1. What is the main purpose of Automated Incident Triage?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
-
----
-
-## You Know You Have Completed This Module When...
-
-- [ ] All exercises completed
-- [ ] Validation script passes: `bash modules/04-incident-triage/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
-- [ ] Self-check questions answered confidently
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
-```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
-```
-
-**Issue: Permission denied**
-```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
-```
-
----
-
-**Next: [Module 05 →](../05-chatops-integration/)**
+**Next: [Module 05 ->](../05-chatops-integration/)**

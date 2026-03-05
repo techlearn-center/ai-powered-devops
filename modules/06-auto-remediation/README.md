@@ -12,174 +12,239 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of Auto-Remediation Workflows
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Build an auto-remediation engine that matches incidents to known fix patterns
+- Implement safety guardrails: dry-run mode, approval workflows, circuit breakers, and rate limiting
+- Use LLMs to suggest remediation steps for unknown failure patterns
+- Execute multi-step remediation plans with rollback capability
+- Understand human-in-the-loop design for production safety
 
 ---
 
 ## Concepts
 
-### What is Auto-Remediation Workflows?
+### The Remediation Pipeline
 
-Auto-Remediation Workflows is a fundamental component of AI-Powered DevOps: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
-
-**Real-world analogy:** Think of Auto-Remediation Workflows like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
-
-### Why Does This Matter?
-
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+```
+Incident Alert
+      |
+      v
++---------------------+
+| Pattern Matcher     |  <-- Known patterns: high CPU, disk full, crash loop, etc.
+| (keyword + labels)  |
++---------------------+
+      |
+      +-- Match found -----> Use predefined actions
+      |
+      +-- No match --------> LLM suggests actions
+      |
+      v
++---------------------+
+| Safety Checks       |
+| - Circuit breaker   |
+| - Rate limiter      |
+| - Confidence check  |
++---------------------+
+      |
+      v
++---------------------+     +---------------------+
+| Dry Run / Execute   |---->| Approval Workflow    |
+| (per-action)        |     | (for high-risk ops)  |
++---------------------+     +---------------------+
+      |
+      v
++---------------------+
+| Results + Rollback  |
++---------------------+
+```
 
 ### Key Terminology
 
 | Term | Definition |
 |---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+| **Dry Run** | Simulating remediation actions without executing them; logs what would happen |
+| **Circuit Breaker** | Stops all auto-remediation after 3+ consecutive failures to prevent cascading damage |
+| **Rate Limiter** | Caps remediation executions to N per hour to prevent runaway automation |
+| **Human-in-the-Loop** | Requiring human approval before executing high-risk actions |
+| **Rollback Command** | A pre-defined command to undo a remediation step if it makes things worse |
+| **Confidence Score** | 0.0-1.0 rating of how certain the engine is about the remediation; below 0.5 escalates to humans |
 
 ---
 
 ## Hands-On Lab
 
-### Prerequisites Check
+### Step 1: Understanding Remediation Patterns
 
-Before starting, verify your environment:
+```python
+"""
+patterns_lab.py - Explore the built-in remediation patterns
+"""
+from src.remediation.auto_remediate import REMEDIATION_PATTERNS
 
-```bash
-# Check Docker is running
-docker --version
-docker compose version
-
-# Check you have the project cloned
-ls modules/06-auto-remediation/
+for name, pattern in REMEDIATION_PATTERNS.items():
+    print(f"\n=== {name} ===")
+    print(f"  Description: {pattern['description']}")
+    print(f"  Keywords: {pattern['match_keywords']}")
+    print(f"  Confidence: {pattern['confidence']}")
+    print(f"  Actions:")
+    for action in pattern['actions']:
+        risk = f" [RISK: {action.risk_level}]" if action.risk_level != "low" else ""
+        approval = " [NEEDS APPROVAL]" if action.requires_approval else ""
+        print(f"    - {action.name}: {action.description}{risk}{approval}")
+        if action.command:
+            print(f"      Command: {action.command}")
+        if action.rollback_command:
+            print(f"      Rollback: {action.rollback_command}")
 ```
 
-### Exercise 1: Setup and Configuration
+### Step 2: Dry Run Mode
 
-**Goal:** Get the foundation in place for this module.
+```python
+"""
+dry_run_lab.py - Test remediation without executing anything
+"""
+import asyncio
+from src.remediation.auto_remediate import RemediationEngine, IncidentContext
 
-**Step 1:** Review the starter files
-```bash
-ls modules/06-auto-remediation/lab/starter/
+async def main():
+    engine = RemediationEngine(dry_run=True)  # SAFE: dry run mode
+
+    incident = IncidentContext(
+        incident_id="INC-20240115-001",
+        alert_name="DiskSpaceCritical",
+        severity="SEV2",
+        service="order-service",
+        description="Disk usage at 97% on /var/log partition",
+        labels={"metric": "disk_usage_percent"},
+        metrics={"disk_percent": 97},
+    )
+
+    plan = await engine.evaluate_and_remediate(incident)
+
+    print(f"Plan ID: {plan.plan_id}")
+    print(f"Pattern: {plan.pattern_matched}")
+    print(f"Status: {plan.status.value}")
+    print(f"Confidence: {plan.confidence_score}")
+
+    print(f"\nActions ({len(plan.results)} steps):")
+    for r in plan.results:
+        print(f"  [{r['status']}] {r['action']}: {r['message']}")
+
+asyncio.run(main())
 ```
 
-**Step 2:** Set up the required environment
-```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/06-auto-remediation/lab/starter/
+### Step 3: Safety Guardrails
+
+```python
+"""
+safety_guardrails_lab.py - Test circuit breaker and rate limiter
+"""
+import asyncio
+from src.remediation.auto_remediate import RemediationEngine, IncidentContext
+
+async def main():
+    engine = RemediationEngine(dry_run=True, max_auto_remediations_per_hour=3)
+
+    # Simulate hitting the rate limit
+    for i in range(5):
+        incident = IncidentContext(
+            incident_id=f"INC-{i}",
+            alert_name="HighCPU",
+            severity="SEV3",
+            service="test-service",
+            description="CPU spike detected",
+            labels={},
+            metrics={"cpu_percent": 95},
+        )
+        plan = await engine.evaluate_and_remediate(incident)
+        print(f"Attempt {i+1}: status={plan.status.value}")
+
+    # Check stats
+    stats = engine.get_stats()
+    print(f"\nStats: {stats}")
+
+asyncio.run(main())
 ```
 
-**Step 3:** Verify the setup
+### Step 4: LLM-Suggested Remediation for Unknown Patterns
+
+```python
+"""
+llm_suggestion_lab.py - Handle incidents the engine hasn't seen before
+"""
+import asyncio
+from src.remediation.auto_remediate import RemediationEngine, IncidentContext
+
+async def main():
+    engine = RemediationEngine(dry_run=True)
+
+    # An unusual incident that doesn't match predefined patterns
+    incident = IncidentContext(
+        incident_id="INC-NOVEL-001",
+        alert_name="UnusualTrafficPattern",
+        severity="SEV2",
+        service="api-gateway",
+        description="Request rate dropped 80% suddenly with no deployment changes. "
+                    "Upstream DNS resolver returning SERVFAIL for 30% of queries.",
+        labels={"region": "us-east-1"},
+        metrics={"request_rate": 250, "normal_rate": 1200},
+    )
+
+    plan = await engine.evaluate_and_remediate(incident)
+    print(f"Pattern matched: {plan.pattern_matched}")
+    print(f"Confidence: {plan.confidence_score}")
+    print(f"Status: {plan.status.value}")
+
+    for action in plan.actions:
+        print(f"\nSuggested: {action.name}")
+        print(f"  {action.description}")
+        if action.command:
+            print(f"  Command: {action.command}")
+        print(f"  Risk: {action.risk_level} | Approval: {action.requires_approval}")
+
+asyncio.run(main())
+```
+
+### Step 5: REST API Usage
+
 ```bash
-# Run the validation to check your setup
+# Evaluate a remediation plan
+curl -X POST http://localhost:8000/api/remediation/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "incident_id": "INC-001",
+    "alert_name": "HighCPU",
+    "severity": "SEV2",
+    "service": "order-service",
+    "description": "CPU at 95%",
+    "metrics": {"cpu_percent": 95}
+  }'
+
+# View history
+curl http://localhost:8000/api/remediation/history
+
+# Check stats
+curl http://localhost:8000/api/remediation/stats
+```
+
+---
+
+## Key Takeaways
+
+1. Always start with dry-run mode enabled. Switch to live execution only after thorough testing.
+2. The circuit breaker prevents cascading damage -- if three remediations fail in 30 minutes, all automation pauses.
+3. Rate limiting (N per hour) prevents runaway automation loops.
+4. High-risk actions (restarts, rollbacks, connection termination) must require human approval in production.
+5. LLM suggestions for unknown patterns are marked with lower confidence and default to escalation.
+6. Every action should have a rollback command so damage can be reversed.
+
+---
+
+## Validation
+
+```bash
 bash modules/06-auto-remediation/validation/validate.sh
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
-
-### Exercise 2: Core Implementation
-
-**Goal:** Implement the main concept of this module.
-
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
-
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
-
-### Exercise 3: Integration and Testing
-
-**Goal:** Connect this module's work with the broader system.
-
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
-
 ---
 
-## Starter Files
-
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
-
-## Solution Files
-
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
-
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
-
----
-
-## Common Mistakes
-
-| Mistake | Symptom | Fix |
-|---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
-
----
-
-## Self-Check Questions
-
-Test your understanding before moving on:
-
-1. What is the main purpose of Auto-Remediation Workflows?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
-
----
-
-## You Know You Have Completed This Module When...
-
-- [ ] All exercises completed
-- [ ] Validation script passes: `bash modules/06-auto-remediation/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
-- [ ] Self-check questions answered confidently
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
-```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
-```
-
-**Issue: Permission denied**
-```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
-```
-
----
-
-**Next: [Module 07 →](../07-intelligent-monitoring/)**
+**Next: [Module 07 ->](../07-intelligent-monitoring/)**

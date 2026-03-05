@@ -12,174 +12,275 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of Intelligent Monitoring and Alerting
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Build an LLM-enhanced alerting system that reduces noise and groups related alerts
+- Implement alert deduplication and suppression using semantic similarity
+- Use LLMs to generate human-readable alert summaries from raw metric data
+- Build dynamic thresholds that adapt to traffic patterns (day/night, weekday/weekend)
+- Create intelligent on-call escalation policies
 
 ---
 
 ## Concepts
 
-### What is Intelligent Monitoring and Alerting?
+### The Intelligent Monitoring Pipeline
 
-Intelligent Monitoring and Alerting is a fundamental component of AI-Powered DevOps: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
-
-**Real-world analogy:** Think of Intelligent Monitoring and Alerting like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
-
-### Why Does This Matter?
-
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+```
+Raw Alerts              Noise Reduction              Enriched Output
++-------------+     +---------------------+     +---------------------+
+| Prometheus  |---->| Deduplication       |     | Grouped Alert       |
+| AlertManager|---->| (fingerprint match) |     |  - summary text     |
+| CloudWatch  |     +---------------------+     |  - affected services|
++-------------+            |                    |  - runbook link     |
+                           v                    |  - severity         |
+                    +---------------------+     |  - on-call owner    |
+                    | Semantic Grouping   |---->+---------------------+
+                    | (LLM correlation)   |
+                    +---------------------+
+                           |
+                           v
+                    +---------------------+
+                    | Dynamic Thresholds  |
+                    | (time-of-day aware) |
+                    +---------------------+
+```
 
 ### Key Terminology
 
 | Term | Definition |
 |---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+| **Alert Fatigue** | When operators receive so many alerts that they start ignoring them |
+| **Noise Ratio** | Percentage of alerts that do not require human action |
+| **Semantic Grouping** | Using LLM understanding to group alerts that share a root cause |
+| **Dynamic Threshold** | Alert thresholds that change based on time of day, day of week, or load patterns |
+| **Suppression** | Silencing an alert during a known maintenance window or for a known issue |
 
 ---
 
 ## Hands-On Lab
 
-### Prerequisites Check
+### Step 1: Alert Deduplication Engine
 
-Before starting, verify your environment:
+```python
+"""
+alert_dedup.py - Deduplicate alerts using fingerprinting
+"""
+import hashlib
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
 
-```bash
-# Check Docker is running
-docker --version
-docker compose version
 
-# Check you have the project cloned
-ls modules/07-intelligent-monitoring/
+@dataclass
+class Alert:
+    name: str
+    service: str
+    description: str
+    severity: str
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+
+
+class AlertDeduplicator:
+    def __init__(self, window_minutes: int = 30):
+        self.window = timedelta(minutes=window_minutes)
+        self._seen: dict[str, datetime] = {}
+
+    def _fingerprint(self, alert: Alert) -> str:
+        key = f"{alert.name}:{alert.service}:{alert.severity}"
+        return hashlib.md5(key.encode()).hexdigest()[:16]
+
+    def is_duplicate(self, alert: Alert) -> bool:
+        fp = self._fingerprint(alert)
+        now = datetime.utcnow()
+
+        # Clean expired entries
+        self._seen = {k: v for k, v in self._seen.items() if now - v < self.window}
+
+        if fp in self._seen:
+            return True
+
+        self._seen[fp] = now
+        return False
+
+
+# Test: same alert fired 3 times in 5 minutes
+dedup = AlertDeduplicator(window_minutes=30)
+alerts = [
+    Alert(name="HighCPU", service="api-gateway", description="CPU at 92%", severity="warning"),
+    Alert(name="HighCPU", service="api-gateway", description="CPU at 94%", severity="warning"),
+    Alert(name="HighCPU", service="api-gateway", description="CPU at 96%", severity="warning"),
+    Alert(name="HighMemory", service="api-gateway", description="Memory at 88%", severity="warning"),
+]
+
+for a in alerts:
+    dup = dedup.is_duplicate(a)
+    print(f"{'[DUP]' if dup else '[NEW]'} {a.name} on {a.service}: {a.description}")
 ```
 
-### Exercise 1: Setup and Configuration
+### Step 2: LLM-Powered Alert Summarization
 
-**Goal:** Get the foundation in place for this module.
+```python
+"""
+alert_summarizer.py - Generate human-readable summaries from raw alerts
+"""
+import os, json
+from openai import OpenAI
+from dotenv import load_dotenv
 
-**Step 1:** Review the starter files
-```bash
-ls modules/07-intelligent-monitoring/lab/starter/
+load_dotenv()
+client = OpenAI()
+
+
+def summarize_alerts(alerts: list[dict]) -> str:
+    prompt = f"""You are an on-call SRE receiving these alerts:
+
+{json.dumps(alerts, indent=2)}
+
+Write a 3-5 sentence executive summary that:
+1. States the most critical issue first
+2. Identifies the probable root cause
+3. Lists affected services
+4. Recommends immediate action
+
+Be concise. This will be sent to the on-call engineer's phone."""
+
+    response = client.chat.completions.create(
+        model="gpt-4", temperature=0.2, max_tokens=300,
+        messages=[
+            {"role": "system", "content": "You are a senior SRE writing alert summaries."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
+alerts = [
+    {"name": "HighCPU", "service": "order-service", "value": "95%", "duration": "10 min"},
+    {"name": "HighLatency", "service": "order-service", "value": "P99=4.2s", "duration": "8 min"},
+    {"name": "HighErrorRate", "service": "order-service", "value": "5xx=12%", "duration": "7 min"},
+    {"name": "DBConnectionPool", "service": "order-db", "value": "98% used", "duration": "12 min"},
+]
+
+summary = summarize_alerts(alerts)
+print(summary)
 ```
 
-**Step 2:** Set up the required environment
-```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/07-intelligent-monitoring/lab/starter/
+### Step 3: Dynamic Thresholds
+
+```python
+"""
+dynamic_thresholds.py - Time-aware alert thresholds
+"""
+from datetime import datetime
+
+
+class DynamicThreshold:
+    """Adjust alert thresholds based on time of day and day of week."""
+
+    def __init__(self, base_threshold: float, metric_name: str):
+        self.base = base_threshold
+        self.metric_name = metric_name
+
+    def get_threshold(self, timestamp: datetime = None) -> float:
+        ts = timestamp or datetime.utcnow()
+        hour = ts.hour
+        is_weekend = ts.weekday() >= 5
+
+        # Relax thresholds during low-traffic periods
+        if is_weekend:
+            multiplier = 0.7  # Lower traffic on weekends, so lower threshold
+        elif 2 <= hour <= 6:
+            multiplier = 0.5  # Very low traffic at night
+        elif 9 <= hour <= 17:
+            multiplier = 1.0  # Business hours: normal threshold
+        else:
+            multiplier = 0.8  # Off-hours
+
+        return self.base * multiplier
+
+    def should_alert(self, value: float, timestamp: datetime = None) -> bool:
+        return value > self.get_threshold(timestamp)
+
+
+# CPU threshold: 85% during business hours, ~43% at 3am, ~60% on weekends
+cpu_threshold = DynamicThreshold(base_threshold=85.0, metric_name="cpu_percent")
+
+test_times = [
+    datetime(2024, 1, 15, 10, 0),  # Monday 10am
+    datetime(2024, 1, 15, 3, 0),   # Monday 3am
+    datetime(2024, 1, 20, 14, 0),  # Saturday 2pm
+]
+
+for ts in test_times:
+    threshold = cpu_threshold.get_threshold(ts)
+    print(f"{ts.strftime('%A %H:%M')}: threshold = {threshold:.0f}%")
 ```
 
-**Step 3:** Verify the setup
+### Step 4: Semantic Alert Grouping
+
+```python
+"""
+alert_grouper.py - Group related alerts into incidents using LLM
+"""
+import os, json
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
+client = OpenAI()
+
+
+def group_alerts(alerts: list[dict]) -> list[dict]:
+    prompt = f"""Group these alerts by root cause. Alerts that are likely caused
+by the same underlying issue should be in the same group.
+
+Alerts:
+{json.dumps(alerts, indent=2)}
+
+Return JSON array of groups:
+[{{"group_name": "...", "root_cause": "...", "alert_indices": [0, 1, ...], "severity": "SEV1-5"}}]"""
+
+    response = client.chat.completions.create(
+        model="gpt-4", temperature=0.1, max_tokens=500,
+        messages=[
+            {"role": "system", "content": "You are an SRE grouping correlated alerts."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return json.loads(response.choices[0].message.content.strip())
+
+
+alerts = [
+    {"name": "HighCPU", "service": "order-service"},
+    {"name": "HighLatency", "service": "order-service"},
+    {"name": "HighErrorRate", "service": "order-service"},
+    {"name": "DBPoolExhausted", "service": "order-db"},
+    {"name": "DiskSpaceLow", "service": "log-collector"},
+]
+
+groups = group_alerts(alerts)
+for g in groups:
+    print(f"\nGroup: {g['group_name']} ({g['severity']})")
+    print(f"  Root cause: {g['root_cause']}")
+    print(f"  Alerts: {[alerts[i]['name'] for i in g['alert_indices']]}")
+```
+
+---
+
+## Key Takeaways
+
+1. Alert deduplication alone can reduce noise by 40-60% in a typical environment.
+2. Semantic grouping (via LLM) collapses N related alerts into one actionable incident.
+3. Dynamic thresholds prevent 3am pages for normal low-traffic metric levels.
+4. LLM-generated summaries give on-call engineers immediate context without dashboard diving.
+5. Combine all techniques: dedup -> group -> summarize -> dynamic threshold -> page.
+
+---
+
+## Validation
+
 ```bash
-# Run the validation to check your setup
 bash modules/07-intelligent-monitoring/validation/validate.sh
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
-
-### Exercise 2: Core Implementation
-
-**Goal:** Implement the main concept of this module.
-
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
-
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
-
-### Exercise 3: Integration and Testing
-
-**Goal:** Connect this module's work with the broader system.
-
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
-
 ---
 
-## Starter Files
-
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
-
-## Solution Files
-
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
-
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
-
----
-
-## Common Mistakes
-
-| Mistake | Symptom | Fix |
-|---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
-
----
-
-## Self-Check Questions
-
-Test your understanding before moving on:
-
-1. What is the main purpose of Intelligent Monitoring and Alerting?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
-
----
-
-## You Know You Have Completed This Module When...
-
-- [ ] All exercises completed
-- [ ] Validation script passes: `bash modules/07-intelligent-monitoring/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
-- [ ] Self-check questions answered confidently
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
-```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
-```
-
-**Issue: Permission denied**
-```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
-```
-
----
-
-**Next: [Module 08 →](../08-code-review-ai/)**
+**Next: [Module 08 ->](../08-code-review-ai/)**

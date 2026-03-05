@@ -12,174 +12,177 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of ChatOps with AI Assistants
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Build a Slack bot that responds to natural language DevOps commands
+- Implement intent classification using regex patterns with LLM fallback
+- Create rich Slack Block Kit responses for operational data
+- Integrate with deployment, health check, and incident systems
+- Handle Slack Events API webhooks in FastAPI
 
 ---
 
 ## Concepts
 
-### What is ChatOps with AI Assistants?
+### ChatOps Architecture
 
-ChatOps with AI Assistants is a fundamental component of AI-Powered DevOps: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
-
-**Real-world analogy:** Think of ChatOps with AI Assistants like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
-
-### Why Does This Matter?
-
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+```
+Slack Workspace                ChatOps Bot                   Backend Systems
++------------------+     +--------------------+       +---------------------+
+| "@bot deploy     |     | Intent Classifier  |       | ArgoCD (deploys)    |
+|  status auth"    |---->| (regex patterns)   |------>| Health endpoints    |
++------------------+     +--------------------+       | PagerDuty (incidents|
+        ^                        |                    | Prometheus (metrics)|
+        |                        v                    +---------------------+
+        |               +--------------------+
+        +---------------| Response Handler   |
+         Rich Block Kit | - deploy_status    |
+         messages       | - health_check     |
+                        | - incident_summary |
+                        | - runbook          |
+                        | - metrics          |
+                        | - general (LLM)    |
+                        +--------------------+
+```
 
 ### Key Terminology
 
 | Term | Definition |
 |---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+| **Intent Classification** | Determining what the user wants from their natural language message |
+| **Block Kit** | Slack's UI framework for building rich, interactive messages |
+| **Service Alias** | Short names that map to canonical service names ("auth" -> "auth-service") |
+| **Ephemeral Message** | A Slack message visible only to the requesting user |
 
 ---
 
 ## Hands-On Lab
 
-### Prerequisites Check
+### Step 1: Setting Up the Slack App
 
-Before starting, verify your environment:
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) and create a new app
+2. Add bot token scopes: `chat:write`, `app_mentions:read`, `channels:history`
+3. Install to your workspace and copy the Bot Token
 
 ```bash
-# Check Docker is running
-docker --version
-docker compose version
-
-# Check you have the project cloned
-ls modules/05-chatops-integration/
+# Add to .env
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_SIGNING_SECRET=your-signing-secret
 ```
 
-### Exercise 1: Setup and Configuration
+### Step 2: Intent Classification
 
-**Goal:** Get the foundation in place for this module.
+```python
+"""
+intent_lab.py - Test the intent classifier on various queries
+"""
+from src.chatops.slack_bot import classify_intent
 
-**Step 1:** Review the starter files
-```bash
-ls modules/05-chatops-integration/lab/starter/
+test_messages = [
+    "What's the deployment status for auth-service in production?",
+    "Is the order service healthy?",
+    "Show me current incidents",
+    "How do I fix a connection pool exhaustion?",
+    "What's the CPU usage for api-gateway?",
+    "Can you explain Kubernetes rolling updates?",
+]
+
+for msg in test_messages:
+    cmd = classify_intent(msg)
+    print(f"'{msg}'")
+    print(f"  Intent: {cmd.intent} | Service: {cmd.service} | Env: {cmd.environment}\n")
 ```
 
-**Step 2:** Set up the required environment
-```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/05-chatops-integration/lab/starter/
+### Step 3: Rich Slack Responses
+
+```python
+"""
+slack_blocks_lab.py - Build rich deployment status messages
+"""
+
+def build_deploy_blocks(deployments: dict) -> list[dict]:
+    blocks = [{"type": "header", "text": {"type": "plain_text", "text": "Deployment Status"}}]
+
+    status_icons = {"healthy": ":white_check_mark:", "deploying": ":arrows_counterclockwise:", "failed": ":x:"}
+
+    for service, info in deployments.items():
+        icon = status_icons.get(info["status"], ":question:")
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": (
+                f"*{service}*\n"
+                f"{icon} Status: `{info['status']}` | Version: `{info['version']}`\n"
+                f"Deployed: {info['deployed_at']}"
+            )},
+        })
+    return blocks
+
+blocks = build_deploy_blocks({
+    "api-gateway": {"version": "v2.14.3", "status": "healthy", "deployed_at": "2 hours ago"},
+    "order-service": {"version": "v3.2.0", "status": "deploying", "deployed_at": "5 min ago"},
+})
+print(f"Generated {len(blocks)} blocks")
 ```
 
-**Step 3:** Verify the setup
+### Step 4: Testing the Bot Locally (No Slack Needed)
+
+```python
+"""
+bot_test_lab.py - Test the bot without a Slack connection
+"""
+import asyncio
+from src.chatops.slack_bot import DevOpsBot
+
+async def main():
+    bot = DevOpsBot()
+
+    queries = [
+        "What's deployed in production?",
+        "Is the auth service healthy?",
+        "Show me current incidents",
+        "How do I troubleshoot high memory usage?",
+    ]
+
+    for query in queries:
+        print(f"\nUser: {query}")
+        response = await bot.handle_message(query)
+        print(f"Bot: {response.text[:200]}")
+
+asyncio.run(main())
+```
+
+### Step 5: REST API (Bypass Slack for Testing)
+
 ```bash
-# Run the validation to check your setup
+uvicorn src.main:app --reload
+
+# Send a ChatOps message directly
+curl -X POST http://localhost:8000/api/chatops/message \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Is the order service healthy?"}'
+
+# Test runbook lookup
+curl -X POST http://localhost:8000/api/chatops/message \
+  -H "Content-Type: application/json" \
+  -d '{"text": "How do I fix a connection pool exhaustion?"}'
+```
+
+---
+
+## Key Takeaways
+
+1. Regex-based intent classification handles common queries instantly without LLM latency.
+2. The LLM fallback ensures the bot can answer any question, even unanticipated ones.
+3. Slack Block Kit makes responses far more scannable than plain text.
+4. Service aliases ("auth" -> "auth-service") make the bot feel natural to use.
+5. The `/api/chatops/message` REST endpoint lets you test without Slack infrastructure.
+
+---
+
+## Validation
+
+```bash
 bash modules/05-chatops-integration/validation/validate.sh
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
-
-### Exercise 2: Core Implementation
-
-**Goal:** Implement the main concept of this module.
-
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
-
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
-
-### Exercise 3: Integration and Testing
-
-**Goal:** Connect this module's work with the broader system.
-
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
-
 ---
 
-## Starter Files
-
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
-
-## Solution Files
-
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
-
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
-
----
-
-## Common Mistakes
-
-| Mistake | Symptom | Fix |
-|---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
-
----
-
-## Self-Check Questions
-
-Test your understanding before moving on:
-
-1. What is the main purpose of ChatOps with AI Assistants?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
-
----
-
-## You Know You Have Completed This Module When...
-
-- [ ] All exercises completed
-- [ ] Validation script passes: `bash modules/05-chatops-integration/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
-- [ ] Self-check questions answered confidently
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
-```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
-```
-
-**Issue: Permission denied**
-```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
-```
-
----
-
-**Next: [Module 06 →](../06-auto-remediation/)**
+**Next: [Module 06 ->](../06-auto-remediation/)**

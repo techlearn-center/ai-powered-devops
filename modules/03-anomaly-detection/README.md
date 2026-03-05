@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Time** | 3-5 hours |
-| **Difficulty** | Beginner |
+| **Difficulty** | Intermediate |
 | **Prerequisites** | Module 02 completed |
 
 ---
@@ -12,174 +12,246 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of Anomaly Detection in Metrics
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Implement Z-score and moving-average anomaly detection for time-series data
+- Use LLMs to correlate anomalies across multiple metrics and suggest root causes
+- Build a natural-language-to-PromQL translator using few-shot prompting
+- Reduce alert fatigue by grouping related anomalies into single incidents
 
 ---
 
 ## Concepts
 
-### What is Anomaly Detection in Metrics?
+### Multi-Layer Anomaly Detection
 
-Anomaly Detection in Metrics is a fundamental component of AI-Powered DevOps: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
-
-**Real-world analogy:** Think of Anomaly Detection in Metrics like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
-
-### Why Does This Matter?
-
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+```
+Prometheus / Grafana          Statistical Layer            LLM Correlation
++------------------+     +---------------------+     +--------------------+
+| CPU metrics      |---->| Z-Score Detector    |---->|                    |
+| Memory metrics   |---->| Moving Avg Detector |---->| GPT-4 Multi-Metric|
+| Latency P99      |---->| Seasonal Detector   |---->| Correlator         |
+| Error rates      |     +---------------------+     +--------------------+
++------------------+            |                            |
+                                v                            v
+                      +-----------------+          +-------------------+
+                      | Per-Metric      |          | Correlated Alert  |
+                      | Anomaly Events  |          | (grouped, ranked) |
+                      +-----------------+          +-------------------+
+```
 
 ### Key Terminology
 
 | Term | Definition |
 |---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+| **Z-Score** | Number of standard deviations a data point is from the mean; values above 3.0 are typically anomalous |
+| **Moving Average** | Rolling window average that adapts to gradual trend changes |
+| **Multi-Metric Correlation** | Connecting anomalies across CPU, memory, latency, and error rate to find a single root cause |
+| **PromQL** | Prometheus Query Language used to query time-series metrics |
+| **Alert Fatigue** | Operator burnout from receiving too many uncorrelated, noisy alerts |
 
 ---
 
 ## Hands-On Lab
 
-### Prerequisites Check
+### Step 1: Z-Score Anomaly Detection
 
-Before starting, verify your environment:
+```python
+"""
+zscore_detector.py - Detect spikes using standard deviation
+"""
+import math
+from dataclasses import dataclass
 
-```bash
-# Check Docker is running
-docker --version
-docker compose version
 
-# Check you have the project cloned
-ls modules/03-anomaly-detection/
+@dataclass
+class MetricPoint:
+    timestamp: float
+    value: float
+    label: str = ""
+
+
+@dataclass
+class Anomaly:
+    point: MetricPoint
+    z_score: float
+    direction: str   # "spike" or "drop"
+    severity: str    # "warning" or "critical"
+
+
+def detect_zscore_anomalies(
+    data: list[MetricPoint],
+    warning_threshold: float = 2.0,
+    critical_threshold: float = 3.0,
+) -> list[Anomaly]:
+    if len(data) < 10:
+        return []
+
+    values = [p.value for p in data]
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    std_dev = math.sqrt(variance) if variance > 0 else 1.0
+
+    anomalies = []
+    for point in data:
+        z = (point.value - mean) / std_dev
+        if abs(z) >= critical_threshold:
+            anomalies.append(Anomaly(point=point, z_score=z,
+                direction="spike" if z > 0 else "drop", severity="critical"))
+        elif abs(z) >= warning_threshold:
+            anomalies.append(Anomaly(point=point, z_score=z,
+                direction="spike" if z > 0 else "drop", severity="warning"))
+
+    return anomalies
+
+
+# Inject anomalies at positions 50 and 75
+cpu_data = [MetricPoint(timestamp=i, value=45 + (i % 5)) for i in range(100)]
+cpu_data[50] = MetricPoint(timestamp=50, value=98)
+cpu_data[75] = MetricPoint(timestamp=75, value=95)
+
+for a in detect_zscore_anomalies(cpu_data):
+    print(f"[{a.severity}] {a.direction} at t={a.point.timestamp}: "
+          f"value={a.point.value}, z={a.z_score:.2f}")
 ```
 
-### Exercise 1: Setup and Configuration
+### Step 2: Moving Average Detector
 
-**Goal:** Get the foundation in place for this module.
+```python
+"""
+moving_avg_detector.py - Sliding window anomaly detection
+"""
+from collections import deque
 
-**Step 1:** Review the starter files
-```bash
-ls modules/03-anomaly-detection/lab/starter/
+
+class MovingAverageDetector:
+    def __init__(self, window_size: int = 30, sensitivity: float = 2.0):
+        self.window_size = window_size
+        self.sensitivity = sensitivity
+        self._window: deque[float] = deque(maxlen=window_size)
+
+    def ingest(self, timestamp: float, value: float) -> dict | None:
+        if len(self._window) < self.window_size:
+            self._window.append(value)
+            return None
+
+        avg = sum(self._window) / len(self._window)
+        std = (sum((v - avg) ** 2 for v in self._window) / len(self._window)) ** 0.5
+        threshold = avg + (self.sensitivity * max(std, 1.0))
+        self._window.append(value)
+
+        if value > threshold:
+            return {
+                "timestamp": timestamp, "value": value,
+                "moving_avg": round(avg, 2), "threshold": round(threshold, 2),
+            }
+        return None
+
+
+detector = MovingAverageDetector(window_size=20, sensitivity=2.5)
+latency_values = [12, 14, 11, 13, 15, 12, 14, 11, 13, 12,
+                  14, 13, 11, 15, 12, 13, 14, 11, 12, 13,
+                  14, 12, 11, 85, 90, 13, 12, 14, 11, 13]
+
+for i, val in enumerate(latency_values):
+    result = detector.ingest(timestamp=i, value=val)
+    if result:
+        print(f"Anomaly at t={i}: latency={val}ms (avg={result['moving_avg']}ms)")
 ```
 
-**Step 2:** Set up the required environment
-```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/03-anomaly-detection/lab/starter/
+### Step 3: LLM Multi-Metric Correlation
+
+```python
+"""
+metric_correlator.py - Correlate anomalies across metrics using an LLM
+"""
+import os, json
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
+client = OpenAI()
+
+
+def correlate_anomalies(anomalies_by_metric: dict[str, list[dict]]) -> dict:
+    prompt = "Analyze these anomalies across multiple metrics:\n\n"
+    for metric, anomalies in anomalies_by_metric.items():
+        prompt += f"## {metric}\n"
+        for a in anomalies[:5]:
+            prompt += f"- t={a['timestamp']}: value={a['value']}\n"
+
+    prompt += ("\nReturn JSON: {\"correlated\": bool, \"probable_cause\": str, "
+               "\"leading_indicator\": str, \"recommended_actions\": [str]}")
+
+    response = client.chat.completions.create(
+        model="gpt-4", temperature=0.1,
+        messages=[
+            {"role": "system", "content": "You are an SRE correlating metric anomalies."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return json.loads(response.choices[0].message.content.strip())
+
+
+# Example: CPU spike + latency spike + error rate jump
+result = correlate_anomalies({
+    "cpu_percent": [{"timestamp": 100, "value": 95}, {"timestamp": 101, "value": 98}],
+    "p99_latency_ms": [{"timestamp": 101, "value": 4500}, {"timestamp": 102, "value": 5200}],
+    "error_rate_pct": [{"timestamp": 102, "value": 12.5}],
+})
+print(f"Correlated: {result['correlated']}")
+print(f"Root cause: {result['probable_cause']}")
 ```
 
-**Step 3:** Verify the setup
+### Step 4: Natural Language to PromQL
+
+```python
+"""
+promql_helper.py - Translate natural language to PromQL queries
+"""
+import os, json
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
+client = OpenAI()
+
+EXAMPLES = """
+"CPU usage for auth service" -> rate(container_cpu_usage_seconds_total{service="auth-service"}[5m]) * 100
+"P99 latency for API" -> histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{job="api-gateway"}[5m]))
+"Error rate last hour" -> sum(rate(http_requests_total{status=~"5.."}[1h])) / sum(rate(http_requests_total[1h])) * 100
+"""
+
+
+def nl_to_promql(query: str) -> dict:
+    response = client.chat.completions.create(
+        model="gpt-4", temperature=0.1,
+        messages=[
+            {"role": "system", "content": f"Convert natural language to PromQL.\n{EXAMPLES}\nReturn JSON: {{\"promql\": \"...\", \"explanation\": \"...\"}}"},
+            {"role": "user", "content": query},
+        ],
+    )
+    return json.loads(response.choices[0].message.content.strip())
+
+result = nl_to_promql("Show me error rate for order-service in the last 30 minutes")
+print(f"PromQL: {result['promql']}")
+```
+
+---
+
+## Key Takeaways
+
+1. Statistical detectors (Z-score, moving average) catch obvious spikes cheaply -- use them as a first pass before calling the LLM.
+2. Multi-metric correlation is where LLMs shine: connecting a CPU spike in service A with a latency jump in service B.
+3. Natural-language-to-PromQL lets any team member query metrics without knowing PromQL syntax.
+4. Alert grouping reduces fatigue: one correlated incident instead of three separate alerts.
+
+---
+
+## Validation
+
 ```bash
-# Run the validation to check your setup
 bash modules/03-anomaly-detection/validation/validate.sh
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
-
-### Exercise 2: Core Implementation
-
-**Goal:** Implement the main concept of this module.
-
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
-
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
-
-### Exercise 3: Integration and Testing
-
-**Goal:** Connect this module's work with the broader system.
-
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
-
 ---
 
-## Starter Files
-
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
-
-## Solution Files
-
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
-
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
-
----
-
-## Common Mistakes
-
-| Mistake | Symptom | Fix |
-|---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
-
----
-
-## Self-Check Questions
-
-Test your understanding before moving on:
-
-1. What is the main purpose of Anomaly Detection in Metrics?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
-
----
-
-## You Know You Have Completed This Module When...
-
-- [ ] All exercises completed
-- [ ] Validation script passes: `bash modules/03-anomaly-detection/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
-- [ ] Self-check questions answered confidently
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
-```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
-```
-
-**Issue: Permission denied**
-```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
-```
-
----
-
-**Next: [Module 04 →](../04-incident-triage/)**
+**Next: [Module 04 ->](../04-incident-triage/)**
